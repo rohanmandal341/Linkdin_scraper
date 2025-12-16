@@ -1,7 +1,7 @@
 import os
 import re
 import requests
-from typing import Optional, List
+from typing import Optional, List, Dict
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -16,7 +16,7 @@ GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
 if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
     raise RuntimeError("Missing Google environment variables")
 
-app = FastAPI(title="LinkedIn Public Data Extractor (STRUCTURED · FREE · NO AI)")
+app = FastAPI(title="LinkedIn Public Data Extractor (Deterministic · Amazon Grade)")
 
 # ------------------ MODELS ------------------
 
@@ -26,11 +26,11 @@ class ExtractRequest(BaseModel):
 # ------------------ HELPERS ------------------
 
 def extract_slug(url: str) -> Optional[str]:
-    match = re.search(r"linkedin\.com/in/([^/]+)/?", url)
+    match = re.search(r"linkedin\.com/in/([^/]+)/?", url.lower())
     return match.group(1) if match else None
 
 
-def google_cse_search(slug: str, num_results: int = 5) -> List[dict]:
+def google_cse_search(slug: str, num_results: int = 5) -> List[Dict]:
     query = f"site:linkedin.com/in {slug}"
 
     try:
@@ -45,105 +45,138 @@ def google_cse_search(slug: str, num_results: int = 5) -> List[dict]:
             timeout=10
         )
         data = resp.json()
-    except Exception as e:
-        print("Google request failed:", e)
+    except Exception:
         return []
 
     if "error" in data:
-        print("Google API error:", data["error"])
         return []
 
-    results = []
-    for item in data.get("items", []):
-        results.append({
+    return [
+        {
             "title": item.get("title", ""),
             "snippet": item.get("snippet", ""),
             "url": item.get("link", "")
-        })
+        }
+        for item in data.get("items", [])
+    ]
 
-    return results
+
+# ------------------ SCORING ENGINE ------------------
+
+def score_result(result: Dict, slug: str) -> int:
+    score = 0
+
+    url = result["url"].lower()
+    title = result["title"].lower()
+    snippet = result["snippet"].lower()
+    slug = slug.lower()
+
+    if "linkedin.com/in/" in url:
+        score += 20
+
+    if slug in url:
+        score += 40
+
+    slug_parts = slug.replace("-", " ").split()
+    if all(p in title for p in slug_parts):
+        score += 20
+
+    if "experience:" in snippet:
+        score += 5
+    if "education:" in snippet:
+        score += 5
+    if "location:" in snippet:
+        score += 10
+
+    return score
 
 
-def detect_profile_state(result: dict, slug: str):
-    combined = f"{result['title']} {result['snippet']}".lower()
+def select_best_result(results: List[Dict], slug: str) -> Optional[Dict]:
+    scored = [(score_result(r, slug), r) for r in results]
+    scored.sort(key=lambda x: x[0], reverse=True)
 
-    if "profiles" in combined or "missing" in combined:
-        return "private_or_restricted", 0.3
+    best_score, best_result = scored[0]
 
-    if "/in/" not in result["url"]:
-        return "ambiguous", 0.4
+    if best_score < 50:
+        return None
 
-    if slug not in result["url"]:
-        return "ambiguous", 0.4
+    return best_result
 
-    return "public", 0.9
+
+def has_any_slug_match(results: List[Dict], slug: str) -> bool:
+    slug = slug.lower()
+    return any(slug in r["url"].lower() for r in results)
 
 
 # ------------------ STRUCTURING LOGIC ------------------
 
 KNOWN_CITIES = [
-    "mumbai", "pune", "nashik", "delhi", "bangalore", "bengaluru",
-    "hyderabad", "chennai", "kolkata", "ahmedabad", "india"
+    "mumbai", "pune", "delhi", "bangalore", "bengaluru",
+    "hyderabad", "chennai", "kolkata", "ahmedabad",
+    "india", "new york", "london"
 ]
 
-def structure_google_snippet(title: str, snippet: str) -> dict:
-    data = {
-        "name": None,
-        "headline": None,
-        "about": None,
-        "location": None,
-        "experience": None,
-        "education": None
-    }
 
-    # ---------- NAME ----------
+def structure_google_snippet(title: str, snippet: str) -> Dict:
+    data = {}
+
     if "-" in title:
-        data["name"] = title.split("-")[0].strip()
+        name = title.split("-")[0].strip()
+        if name:
+            data["name"] = name
 
-    # ---------- SPLIT BULLETS ----------
     parts = [p.strip() for p in re.split(r"[·|•]", snippet)]
 
-    # ---------- ABOUT ----------
-    if parts:
+    if parts and parts[0] and parts[0] != "...":
         data["about"] = parts[0]
 
-    # ---------- LOCATION (ROBUST) ----------
-    text_for_location = snippet.lower()
+    for p in parts:
+        if "experience" in p.lower():
+            exp = p.split(":", 1)[-1].strip()
+            if exp and exp != "...":
+                data["experience"] = exp
+
+    for p in parts:
+        if "education" in p.lower():
+            edu = p.split(":", 1)[-1].strip()
+            if edu and edu != "...":
+                data["education"] = edu
+
     for city in KNOWN_CITIES:
-        if city in text_for_location:
+        if city in snippet.lower():
             data["location"] = city.title()
             break
 
-    # ---------- EXPERIENCE ----------
-    for p in parts:
-        if "experience" in p.lower():
-            data["experience"] = p.split(":", 1)[-1].strip()
-
-    # Inline experience heuristic (e.g., "Team DNote")
-    if not data["experience"]:
-        inline_exp = re.search(
-            r"(at|with)\s+([A-Z][A-Za-z0-9 &]+)",
-            snippet
-        )
-        if inline_exp:
-            data["experience"] = inline_exp.group(2).strip()
-
-    # ---------- EDUCATION ----------
-    for p in parts:
-        if "education" in p.lower():
-            data["education"] = p.split(":", 1)[-1].strip()
-
-    # ---------- HEADLINE ----------
-    if data["about"]:
-        headline_match = re.search(
-            r"(final[- ]year.*?|computer science.*?|software engineer.*?|backend.*?|student.*?)(\.|,)",
+    if "about" in data:
+        match = re.search(
+            r"(student|engineer|developer|designer|analyst|specialist|manager)[^.,]*",
             data["about"],
             re.IGNORECASE
         )
-        if headline_match:
-            data["headline"] = headline_match.group(1).strip()
+        if match:
+            data["headline"] = match.group(0).strip()
 
     return data
+
+
+# ------------------ AMAZON-STYLE RESPONSE BUILDER ------------------
+
+def build_response(status: str, reason_code: str, reason_message: str, **extra):
+    confidence_map = {
+        "public_structured": 0.9,
+        "ambiguous": 0.4,
+        "not_found": 0.2
+    }
+
+    response = {
+        "status": status,
+        "confidence": confidence_map.get(status, 0.1),
+        "reason_code": reason_code,
+        "reason_message": reason_message
+    }
+
+    response.update(extra)
+    return response
 
 
 # ------------------ API ------------------
@@ -156,31 +189,48 @@ def extract_profile(req: ExtractRequest):
 
     results = google_cse_search(slug)
 
+    # CASE 1: Google returned nothing
     if not results:
-        return {
-            "status": "not_found",
-            "confidence": 0.1,
-            "raw_google_data": []
-        }
+        return build_response(
+            status="not_found",
+            reason_code="GOOGLE_NO_RESULTS",
+            reason_message="Google did not return any LinkedIn profiles for this URL.",
+            raw_google_data=[]
+        )
 
-    first = results[0]
-    status, confidence = detect_profile_state(first, slug)
+    best = select_best_result(results, slug)
 
-    if status != "public":
-        return {
-            "status": status,
-            "confidence": confidence,
-            "raw_google_data": results
-        }
+    # CASE 2: Results exist but NONE match the slug
+    if not best and not has_any_slug_match(results, slug):
+        return build_response(
+            status="not_found",
+            reason_code="NO_SLUG_MATCH",
+            reason_message=(
+                "LinkedIn profile may be private, removed, or not indexed by Google. "
+                "Google returned profiles, but none match the requested LinkedIn URL."
+            ),
+            raw_google_data=[]
+        )
 
-    structured = structure_google_snippet(
-        first["title"],
-        first["snippet"]
+    # CASE 3: Multiple weak matches
+    if not best:
+        return build_response(
+            status="ambiguous",
+            reason_code="MULTIPLE_CANDIDATES",
+            reason_message=(
+                "Multiple LinkedIn profiles partially match the query. "
+                "Unable to determine the correct profile with high confidence."
+            ),
+            raw_google_data=results
+        )
+
+    # CASE 4: Public profile found
+    structured = structure_google_snippet(best["title"], best["snippet"])
+
+    return build_response(
+        status="public_structured",
+        reason_code="PROFILE_PUBLIC",
+        reason_message="Public LinkedIn profile found and structured using Google public data.",
+        raw_google_data=best,
+        structured_data=structured
     )
-
-    return {
-        "status": "public_structured",
-        "confidence": confidence,
-        "raw_google_data": first,
-        "structured_data": structured
-    }
